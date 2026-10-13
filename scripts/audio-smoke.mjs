@@ -1,0 +1,132 @@
+// Uses real Electron, the actual preload/IPC importer, HTMLMediaElement decoding,
+// Web Audio processing and the desktop UI. Synthetic tones are intentionally quiet.
+import { _electron as electron } from 'playwright';
+import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import assert from 'node:assert/strict';
+const root = process.cwd();
+const artifacts = path.join(root, 'test-results'); await mkdir(artifacts, {recursive: true});
+const profile = await mkdtemp(path.join(tmpdir(), 'wedding-dj-audio-'));
+function tone(seconds, frequency) {
+  const rate=44100, samples=Math.floor(seconds*rate); const data=Buffer.alloc(44+samples*2);
+  data.write('RIFF');data.writeUInt32LE(data.length-8,4);data.write('WAVEfmt ',8);data.writeUInt32LE(16,16);data.writeUInt16LE(1,20);data.writeUInt16LE(1,22);data.writeUInt32LE(rate,24);data.writeUInt32LE(rate*2,28);data.writeUInt16LE(2,32);data.writeUInt16LE(16,34);data.write('data',36);data.writeUInt32LE(samples*2,40);
+  for(let i=0;i<samples;i++)data.writeInt16LE(Math.round(Math.sin(2*Math.PI*frequency*i/rate)*3276*Math.min(1,i/441,(samples-i)/441)),44+i*2);
+  return data;
+}
+const paths = ['01 Reception tone.wav','02 Transition tone.wav','03 Short tone.wav','04 Broken file.mp3'].map(name => path.join(profile,name));
+await writeFile(paths[0],tone(9,440));await writeFile(paths[1],tone(8,660));await writeFile(paths[2],tone(1,880));await writeFile(paths[3],'not audio');
+const hash = async file => createHash('sha256').update(await readFile(file)).digest('hex');
+const originals = await Promise.all(paths.map(hash)); const results=[]; let app;
+const record = message => { results.push(message); console.log(message); };
+async function setSlider(page, name, value) {
+  await page.getByRole('slider',{name,exact:true}).evaluate((element, value) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(element,String(value));
+    element.dispatchEvent(new Event('input',{bubbles:true}));
+    element.dispatchEvent(new Event('change',{bubbles:true}));
+  }, value);
+}
+async function launch() {
+  const env = {...process.env, WEDDING_DJ_DATA_DIR:profile}; delete env.ELECTRON_RUN_AS_NODE;
+  const executablePath=process.env.DJ_SMOKE_EXECUTABLE;
+  const instance = await electron.launch({args:executablePath?[]:[root], ...(executablePath?{executablePath}:{}), env});
+  const page = await instance.firstWindow(); await page.waitForSelector('text=All changes saved');
+  page.setDefaultTimeout(15000);
+  await instance.evaluate(({dialog}, filePaths) => { dialog.showOpenDialog = async () => ({canceled:false,filePaths}); dialog.showMessageBoxSync = () => 1; }, paths);
+  return {instance,page};
+}
+try {
+  let boot=await launch();app=boot.instance;let page=boot.page;
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  page.on('console',msg=>{if(msg.type()==='error')console.log('Renderer:',msg.text());});
+  await page.getByRole('button',{name:'Import music',exact:true}).click();
+  await page.getByRole('cell',{name:'01 Reception tone',exact:false}).first().waitFor();
+  await page.waitForFunction(()=>document.querySelectorAll('tbody tr').length===4);
+  record('PASS: real IPC import and metadata extraction (WAV + corrupt MP3)');
+  const row = title => page.locator('tbody tr').filter({has:page.getByText(title,{exact:true})});
+  await row('01 Reception tone').getByRole('button',{name:'A',exact:true}).click();
+  const deckA = page.locator('.deck-0'); const deckB=page.locator('.deck-1');
+  await deckA.getByRole('button',{name:'Play',exact:true}).click();
+  await page.waitForFunction(()=>Number(document.querySelector('.meter > div').style.width.replace('%',''))>1);
+  await page.waitForFunction(()=>document.querySelector('.deck-0 .progress-line').textContent.startsWith('0:01'));
+  assert.equal(await row('01 Reception tone').getByRole('button',{name:'A',exact:true}).isDisabled(),true);
+  record('PASS: real WAV decoder, advancing playback, nonzero post-mixer signal and playing-deck protection');
+  await setSlider(page,'Seek deck A',2);
+  await setSlider(page,'Master volume',0);
+  await page.waitForFunction(()=>Number(document.querySelector('.meter > div').style.width.replace('%',''))<.2);
+  await setSlider(page,'Master volume',.5);
+  await page.waitForFunction(()=>Number(document.querySelector('.meter > div').style.width.replace('%',''))>1);
+  record('PASS: seek and master volume affect the actual audio signal');
+  await page.context().setOffline(true);
+  await page.waitForFunction(()=>Number(document.querySelector('.meter > div').style.width.replace('%',''))>1);
+  await page.context().setOffline(false);
+  record('PASS: local decoder/mixer output continues with network disabled');
+  await row('02 Transition tone').getByRole('button',{name:'Queue 02 Transition tone'}).click();
+  await setSlider(page,'Crossfade duration',2);
+  await page.getByRole('button',{name:'Auto DJ',exact:true}).click();
+  await deckB.getByText('02 Transition tone',{exact:true}).waitFor();
+  await page.waitForFunction(()=>document.querySelector('.deck-1 .pill').textContent==='PLAYING',{},{timeout:14000});
+  await page.waitForFunction(()=>document.querySelector('.deck-0 .pill').textContent==='READY',{},{timeout:5000});
+  assert.equal(await page.locator('.queue-item').count(),0);
+  record('PASS: real Auto DJ preparation, crossfade, queue consumption and outgoing deck pause');
+  await page.getByRole('button',{name:'Add sounds',exact:true}).click();
+  await page.locator('.sound-pad').first().waitFor();
+  await page.locator('.sound-pad').nth(0).click();await page.locator('.sound-pad').nth(1).click();
+  await page.waitForFunction(()=>document.querySelectorAll('.sound-pad.sounding').length===2);
+  assert.equal(await deckB.locator('.pill').textContent(),'PLAYING');
+  await page.getByRole('button',{name:'Stop 01 Reception tone',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelectorAll('.sound-pad.sounding').length===1);
+  await page.getByRole('button',{name:'Stop all',exact:true}).click();
+  await page.waitForFunction(()=>!document.querySelector('.sound-pad.sounding'));
+  record('PASS: two effects overlap music; individual stop leaves the other effect playing');
+  await page.getByRole('button',{name:'Manual',exact:true}).click();
+  await deckB.getByRole('button',{name:'Pause',exact:true}).click();
+  await row('04 Broken file').getByRole('button',{name:'Queue 04 Broken file'}).click();
+  await row('03 Short tone').getByRole('button',{name:'Queue 03 Short tone'}).click();
+  await page.getByRole('button',{name:'Next',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelectorAll('.queue-item').length===0,{},{timeout:16000});
+  await page.getByText(/Skipped.*Broken file/).waitFor();
+  record('PASS: corrupt queued audio is reported and skipped; short WAV plays');
+  await page.locator('.sound-pad').first().waitFor();
+  await page.locator('.sound-pad').first().click();
+  await page.waitForFunction(()=>document.querySelector('.sound-pad.sounding'));
+  await page.getByRole('button',{name:'Stop all',exact:true}).click();
+  await page.waitForFunction(()=>!document.querySelector('.sound-pad.sounding'));
+  record('PASS: soundboard actual audio starts and Stop all cleans up effects');
+  await page.getByRole('button',{name:'Edit 01 Reception tone',exact:true}).click();
+  await page.getByLabel('Sound shortcut').fill('1');
+  await page.getByRole('button',{name:'Edit 01 Reception tone',exact:true}).click();
+  await page.locator('.section-eyebrow').click();await page.keyboard.press('1');
+  await page.waitForFunction(()=>document.querySelector('.sound-pad.sounding'));
+  await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.querySelector('.sound-pad.sounding'));
+  record('PASS: configured keyboard shortcut starts an effect and Escape stops it');
+  await row('01 Reception tone').getByRole('button',{name:'Queue 01 Reception tone'}).click();
+  await row('02 Transition tone').getByRole('button',{name:'Queue 02 Transition tone'}).click();
+  await page.getByRole('button',{name:'Move 02 Transition tone up'}).click();
+  await page.getByLabel('New playlist name').fill('Reception rehearsal');await page.getByRole('button',{name:'Playlist',exact:true}).click();
+  await page.getByLabel('Playlist',{exact:true}).selectOption('all');
+  await page.getByRole('button',{name:'Show settings'}).click();
+  await page.getByPlaceholder('https://your-project.web.app/guest.html').fill('https://example.com/guest.html');
+  await page.getByRole('button',{name:'Guest QR',exact:true}).click();
+  await page.getByAltText('Scan to request a song').waitFor();
+  await page.getByRole('button',{name:'Close QR'}).click();
+  await page.getByRole('button',{name:'Show settings'}).click();
+  await page.waitForFunction(()=>document.querySelector('.save-status').textContent==='All changes saved');
+  await page.setViewportSize({width:1920,height:1080});await page.screenshot({path:path.join(artifacts,'desktop-1080p.png'),fullPage:true});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight),true,'1080p console should fit the viewport');
+  assert.equal(await page.getByLabel('Soundboard volume').evaluate(el=>{const r=el.getBoundingClientRect();return r.bottom<=innerHeight&&r.top>=0;}),true,'effects volume should remain visible');
+  await page.setViewportSize({width:1366,height:768});await page.screenshot({path:path.join(artifacts,'desktop-laptop.png'),fullPage:true});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollHeight<=innerHeight),true,'smaller laptop console should fit the viewport');
+  assert.equal(errors.length,0,errors.join('\n'));
+  await app.close();app=undefined;
+  boot=await launch();app=boot.instance;page=boot.page;
+  assert.equal(await page.locator('tbody tr').count(),4);assert.equal(await page.locator('.queue-item').count(),2);assert.equal(await page.locator('.sound-pad').count(),4);
+  assert.equal(await page.locator('.queue-item').first().locator('strong').textContent(),'02 Transition tone');
+  assert.equal(await page.locator('.deck .pill.live').count(),0);
+  assert.deepEqual(await Promise.all(paths.map(hash)),originals);
+  record('PASS: restart restores library, queue order, soundboard and settings without autoplay; original file hashes unchanged');
+  record('NOT VERIFIED: a person listening through the reception speaker system, long session stability, live Firebase deployment');
+  await writeFile(path.join(artifacts,'audio-smoke.json'),JSON.stringify({date:new Date().toISOString(),executable:process.env.DJ_SMOKE_EXECUTABLE || 'development Electron',profile,results},null,2));
+} catch(error) { console.error(error);if(app){const page=await app.firstWindow();await page.screenshot({path:path.join(artifacts,'audio-failure.png'),fullPage:true}).catch(()=>{});}process.exitCode=1; }
+finally { await app?.close(); }

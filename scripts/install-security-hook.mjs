@@ -1,0 +1,10 @@
+import {execFileSync,spawnSync} from 'node:child_process';
+import {chmodSync} from 'node:fs';
+import path from 'node:path';
+const root=execFileSync('git',['rev-parse','--show-toplevel'],{encoding:'utf8',windowsHide:true}).trim();
+const configured=spawnSync('git',['config','--get','core.hooksPath'],{encoding:'utf8',windowsHide:true});
+const previous=configured.stdout.trim();
+if(previous&&previous!=='.githooks')throw Error('An existing Git hook directory is configured. Keep it and integrate the secret scan into that hook instead of overwriting it.');
+chmodSync(path.join(root,'.githooks','pre-commit'),0o755);
+execFileSync('git',['config','--local','core.hooksPath','.githooks'],{windowsHide:true});
+console.log('Local pre-commit secret scan enabled. Existing hooks in another directory are never overwritten.');

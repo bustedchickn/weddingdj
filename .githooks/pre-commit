@@ -1,0 +1,3 @@
+#!/bin/sh
+# Check staged content, working files and fetched history before a local commit.
+node scripts/check-secrets.mjs

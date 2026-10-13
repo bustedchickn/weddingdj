@@ -1,0 +1,84 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function dj() { return signedIn() && request.auth.token.get('dj', false) == true; }
+    function eventOpen(event) { return get(/databases/$(database)/documents/events/$(event)).data.open == true; }
+    function participantPath(event) { return /databases/$(database)/documents/events/$(event)/participants/$(request.auth.uid); }
+    function songPath(event, song) { return /databases/$(database)/documents/events/$(event)/requests/$(song); }
+    function receiptPath(event, song) { return /databases/$(database)/documents/events/$(event)/votes/$(song)/guests/$(request.auth.uid); }
+    function normalized(value) { return value.lower().replace('[^\\p{L}\\p{N}]', ''); }
+    function songId(title, artist) {
+      return hashing.sha256(normalized(title) + '\n' + normalized(artist)).toBase64().replace('/', '_').replace('\\+', '-').replace('=', '');
+    }
+    function validText(value) {
+      return value is string && value.size() > 0 && value.size() <= 120 && value == value.trim()
+        && normalized(value).size() > 0 && !value.lower().matches('.*https?://.*')
+        && !value.matches('.*[\\x00-\\x1f\\x7f].*');
+    }
+    function freshReceipt(event, song) {
+      return !exists(receiptPath(event, song))
+        && getAfter(receiptPath(event, song)).data.keys().hasOnly(['createdAt'])
+        && getAfter(receiptPath(event, song)).data.createdAt == request.time;
+    }
+    function validAction(event, song) {
+      let path = participantPath(event);
+      let before = exists(path) ? get(path).data : {'submissions': 0, 'votes': 0, 'lastSubmitAt': timestamp.date(1970, 1, 1), 'lastVoteAt': timestamp.date(1970, 1, 1)};
+      let after = getAfter(path).data;
+      return after.keys().hasOnly(['submissions', 'votes', 'lastSubmitAt', 'lastVoteAt', 'lastAt', 'lastKind', 'lastRequestId'])
+        && after.submissions is int && after.votes is int
+        && after.lastAt == request.time && after.lastRequestId == song
+        && ((after.lastKind == 'submit' && after.submissions == before.submissions + 1 && after.submissions <= 5
+             && after.votes == before.votes && after.lastSubmitAt == request.time && after.lastVoteAt == before.lastVoteAt
+             && request.time >= before.lastSubmitAt + duration.value(30, 's'))
+          || (after.lastKind == 'vote' && after.votes == before.votes + 1 && after.votes <= 50
+             && after.submissions == before.submissions && after.lastVoteAt == request.time && after.lastSubmitAt == before.lastSubmitAt
+             && request.time >= before.lastVoteAt + duration.value(2, 's')));
+    }
+    function songAdvanced(event, song) {
+      let path = songPath(event, song);
+      let after = getAfter(path).data;
+      return after.updatedAt == request.time
+        && (exists(path) ? after.votes == get(path).data.votes + 1 : after.votes == 1);
+    }
+    match /events/{event} {
+      allow get: if dj();
+      allow update: if dj() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['open']) && request.resource.data.open is bool;
+    }
+    match /events/{event}/requests/{song} {
+      // Public display fields only. Guest identities remain in private documents.
+      allow read: if true;
+      allow create: if signedIn() && eventOpen(event)
+        && request.resource.data.keys().hasOnly(['title', 'artist', 'votes', 'status', 'priority', 'createdAt', 'updatedAt'])
+        && validText(request.resource.data.title) && validText(request.resource.data.artist)
+        && song == songId(request.resource.data.title, request.resource.data.artist)
+        && request.resource.data.status == 'pending' && request.resource.data.priority == 0 && request.resource.data.votes == 1
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time
+        && validAction(event, song) && getAfter(participantPath(event)).data.lastKind == 'submit' && freshReceipt(event, song);
+      allow update: if signedIn() && (
+        (dj() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'priority', 'moderatedAt', 'updatedAt'])
+          && request.resource.data.status in ['pending', 'approved', 'rejected', 'played']
+          && request.resource.data.priority is int && request.resource.data.priority >= 0 && request.resource.data.priority <= 1000
+          && request.resource.data.moderatedAt == request.time && request.resource.data.updatedAt == request.time)
+        || (eventOpen(event) && resource.data.status in ['pending', 'approved']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['votes', 'updatedAt'])
+          && request.resource.data.votes == resource.data.votes + 1 && request.resource.data.updatedAt == request.time
+          && validAction(event, song) && freshReceipt(event, song)));
+    }
+    match /events/{event}/participants/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid && eventOpen(event)
+        && validAction(event, request.resource.data.lastRequestId)
+        && freshReceipt(event, request.resource.data.lastRequestId)
+        && songAdvanced(event, request.resource.data.lastRequestId);
+    }
+    match /events/{event}/votes/{song}/guests/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid && eventOpen(event)
+        && request.resource.data.keys().hasOnly(['createdAt']) && request.resource.data.createdAt == request.time
+        && validAction(event, song) && songAdvanced(event, song);
+    }
+    // No client deletes, quota resets, arbitrary writes or cross-guest private reads.
+    match /{document=**} { allow read, write: if false; }
+  }
+}

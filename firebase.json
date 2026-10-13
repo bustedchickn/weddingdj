@@ -1,0 +1,56 @@
+{
+  "hosting": {
+    "public": "dist-guest",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "redirects": [
+      {
+        "source": "/",
+        "destination": "/guest.html",
+        "type": 302
+      }
+    ],
+    "headers": [
+      {
+        "source": "**",
+        "headers": [
+          {
+            "key": "X-Content-Type-Options",
+            "value": "nosniff"
+          },
+          {
+            "key": "Referrer-Policy",
+            "value": "strict-origin-when-cross-origin"
+          }
+        ]
+      }
+    ]
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "emulators": {
+    "firestore": {
+      "host": "127.0.0.1",
+      "port": 8080
+    },
+    "auth": {
+      "host": "127.0.0.1",
+      "port": 9099
+    },
+    "hub": {
+      "host": "127.0.0.1",
+      "port": 4400
+    },
+    "logging": {
+      "host": "127.0.0.1",
+      "port": 4500
+    },
+    "ui": {
+      "enabled": false
+    }
+  }
+}
